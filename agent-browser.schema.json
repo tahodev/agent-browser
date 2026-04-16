@@ -147,7 +147,7 @@
     },
     "idleTimeout": {
       "type": "string",
-      "description": "Auto-shutdown the daemon after N ms of inactivity (e.g., '60000')."
+      "description": "Auto-shutdown the daemon after inactivity (e.g., '30s', '5m', '1h', or raw milliseconds like '60000')."
     },
     "model": {
       "type": "string",
