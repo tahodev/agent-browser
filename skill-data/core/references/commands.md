@@ -343,7 +343,7 @@ Profiles:
 - `core` - Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
 - `network` - Network routes, request inspection, HAR, headers, credentials, offline
 - `state` - Cookies, storage, auth, saved state, sessions, profiles, skills
-- `debug` - Console/errors, tracing, profiling, recording, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
+- `debug` - Console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` - Back/forward/reload, tabs, windows, frames, dialogs
 - `react` - React tree/inspect/renders/suspense, vitals, pushstate
 - `mobile` - Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
@@ -422,6 +422,20 @@ agent-browser pushstate <url>                       # SPA client-side nav (auto-
 ```
 
 `vitals` prints a summary by default and uses the same fields as the structured `--json` response.
+
+## Accessibility audit
+
+Runs an embedded axe-core audit with no CDN fetch. The vendored engine runs private partial audits through CDP across the page's frame tree and merges serialized results without page messaging, so page CSP does not block it, page-provided `window.axe` values remain intact, and iframe violations retain their frame selector paths. Accessibility audits require a CDP browser and are not available with Safari or iOS WebDriver sessions. Reports WCAG violations with impact, rule id, fix guidance URL, and failing-node selectors.
+
+```bash
+agent-browser a11y                                  # Audit the current page
+agent-browser a11y <url>                            # Navigate, then audit
+agent-browser a11y --tags wcag2a,wcag2aa            # Only rules with these axe tags
+agent-browser a11y --selector "#main"               # Scope audit to a subtree
+agent-browser a11y <url> --json                     # Structured results for automation
+```
+
+`--json` returns `counts` plus `violations`/`incomplete` arrays; each entry has `id`, `impact`, `help`, `helpUrl`, `tags`, `nodeCount`, and up to 10 `nodes` (`target` selector path arrays, `html` snippet, `failureSummary`). Nested `target` arrays preserve shadow DOM boundaries. `incomplete` lists rules axe could not evaluate automatically — review those manually.
 
 ## Init scripts
 
