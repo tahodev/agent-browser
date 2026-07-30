@@ -1438,6 +1438,7 @@ Connect to `ws://localhost:9223` to receive frames and send input:
 ```json
 {
   "type": "frame",
+  "seq": 41,
   "data": "<base64-encoded-jpeg>",
   "metadata": {
     "deviceWidth": 1280,
@@ -1445,10 +1446,13 @@ Connect to `ws://localhost:9223` to receive frames and send input:
     "pageScaleFactor": 1,
     "offsetTop": 0,
     "scrollOffsetX": 0,
-    "scrollOffsetY": 0
+    "scrollOffsetY": 0,
+    "timestamp": 1785038682238
   }
 }
 ```
+
+`seq` is a monotonic frame id, echoed back in an `ack` message under ack pacing. `metadata.timestamp` is the capture time in epoch milliseconds, so a client can tell how old a frame is by the time it draws it.
 
 **Send mouse events:**
 
@@ -1483,6 +1487,17 @@ Connect to `ws://localhost:9223` to receive frames and send input:
   "touchPoints": [{ "x": 100, "y": 200 }]
 }
 ```
+
+**Cap the frame rate (per client):**
+
+```json
+{
+  "type": "config",
+  "maxFps": 10
+}
+```
+
+Frames are delivered latest-first: the server picks the newest frame at send time, so frames produced while an earlier one is still being written are skipped rather than queued. `maxFps` (1 to 120, `0` = uncapped) limits delivery for that client only. A client that sends `{"type":"config","pacing":"ack"}` receives one frame at a time and acknowledges it with `{"type":"ack","seq":N}`, so nothing stale reaches the socket even if that client stalls; in the default push pacing, frames already handed to the transport are still delivered in order. Both settings can also be declared on the URL (`ws://127.0.0.1:<port>/?pacing=ack&maxFps=10`), which is the only way to cover the connection's opening frame. Input events are read on a dedicated task per connection, so clicks and keystrokes dispatch immediately even while frames are mid-write to a slow client.
 
 ## Architecture
 

@@ -49,6 +49,8 @@ The lower-level `screencast_start` and `screencast_stop` commands still control 
 
 Connect to `ws://localhost:9223` to receive frames and send input.
 
+Browser clients must load from `localhost`, `127.0.0.1`, `::1` or `file://`. Any other origin gets a 403 on the upgrade and needs a proxy.
+
 ### Frame messages
 
 The server sends frame messages with base64-encoded images:
@@ -56,6 +58,7 @@ The server sends frame messages with base64-encoded images:
 ```json
 {
   "type": "frame",
+  "seq": 41,
   "data": "<base64-encoded-jpeg>",
   "metadata": {
     "deviceWidth": 1280,
@@ -63,10 +66,15 @@ The server sends frame messages with base64-encoded images:
     "pageScaleFactor": 1,
     "offsetTop": 0,
     "scrollOffsetX": 0,
-    "scrollOffsetY": 0
+    "scrollOffsetY": 0,
+    "timestamp": 1785038682238
   }
 }
 ```
+
+`seq` is a monotonic frame id. It is what an ack pacing client echoes back, and it keeps climbing across browser relaunches so a long-lived client never sees an id go backwards.
+
+`metadata.timestamp` is the capture time in epoch milliseconds. Comparing it against the clock when the frame is drawn gives the age of what is on screen, which is the number worth watching on a constrained link.
 
 ### Status messages
 
@@ -81,6 +89,65 @@ Connection and screencast status:
   "viewportHeight": 720
 }
 ```
+
+### Frame delivery
+
+Frames are delivered latest-first: the server holds only the newest frame and reads it at send time, so every frame produced while an earlier one is still being written is skipped instead of queued. The application never builds a backlog.
+
+In the default push pacing the transport underneath still can: frames already accepted by the socket are delivered in order, so a client that stops reading entirely drains whatever the kernel buffered before the writer blocked. Ack pacing removes that window (see below). Status, console, and tab messages flow through a separate ordered channel, so they are never replaced by a newer message the way frames are. They are not unconditionally durable: a client that falls far enough behind can lag out of that channel and lose messages, so treat console output as a live feed rather than an audit log.
+
+Input handling is independent of frame delivery. Each connection reads input on its own task, so clicks and keystrokes dispatch to the browser immediately even while a large frame is mid-write to a slow client.
+
+### Client configuration
+
+A client can cap its own frame rate by sending a `config` message at any time:
+
+```json
+{
+  "type": "config",
+  "maxFps": 10
+}
+```
+
+`maxFps` caps how many frames per second the server sends to this client (1 to 120). Set `0` to remove the cap (the default). Each client controls its own rate; other connected clients are unaffected.
+
+### Ack pacing
+
+Push pacing hands each frame to the socket as soon as the rate allows, so a client that stalls drains what the transport buffered. To get one frame at a time instead, opt into ack pacing:
+
+```json
+{
+  "type": "config",
+  "pacing": "ack"
+}
+```
+
+The server then keeps at most one frame in flight and waits for the client to acknowledge it:
+
+```json
+{
+  "type": "ack",
+  "seq": 41
+}
+```
+
+Every `frame` message carries a monotonic `seq`. Echo the id of the frame you finished rendering. While an ack is outstanding, newer frames replace each other in the server and never reach the socket, so a client that stalls for ten seconds and resumes receives the current page rather than ten seconds of history. This mirrors how Chrome paces its own screencast upstream with `Page.screencastFrameAck`.
+
+Under ack pacing the frame rate is bounded by one frame per acknowledgement round trip, so a client that queues heavy input on the same socket delays its own acks and throttles its own stream. Measured: input above roughly 120 messages per second on the same connection is enough to do it. Send acks ahead of buffered input, or use push pacing.
+
+Ack pacing bounds one hop. With a proxy in the path, forward the renderer's acks; acks generated on receipt leave frames queued on the far side.
+
+Acks are cumulative: acknowledging a newer id covers every older one, so a client that skips ids still unblocks delivery. A client that opts in and then stops acknowledging simply stops receiving frames, while status, tabs, url, and console keep flowing. Send `{"type":"config","pacing":"push"}` to return to the default.
+
+`pacing` and `maxFps` are independent and compose: pacing bounds how much is in flight, `maxFps` bounds the rate. A preview on a constrained link usually wants both.
+
+A `config` message cannot cover the connection's opening frame, because the server sends the most recent frame as soon as the client connects. To have pacing apply from the very first frame, declare it on the URL instead:
+
+```
+ws://127.0.0.1:<port>/?pacing=ack&maxFps=10
+```
+
+A `config` message sent later still wins. An unrecognized or unparsable value on the URL is ignored rather than failing the connection.
 
 ## Input injection
 
