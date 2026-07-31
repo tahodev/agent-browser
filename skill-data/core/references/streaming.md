@@ -69,7 +69,7 @@ Status, tabs, url, and console travel on an ordered channel: they are delivered 
 {"type": "ack", "seq": 41}
 ```
 
-Input dispatches to the browser on a task of its own, separate from frame delivery, so a click is not queued behind a frame write. Mouse, keyboard, and touch input also reset the daemon idle timer, so an actively driven preview is not shut down by the idle timeout.
+Input dispatches to the browser on a task of its own, separate from frame delivery, so a click is not queued behind a frame write. Events are sent to the browser without waiting for its reply, so a click stays responsive behind a burst of mouse moves. Ordering is preserved: press never overtakes move. Mouse, keyboard, and touch input also reset the daemon idle timer, so an actively driven preview is not shut down by the idle timeout.
 
 `config` sets a per-client frame cap: 1 to 120, or `0` for uncapped (the default). It takes effect immediately, including when it loosens the cap. Each client's cap is its own; other connected clients are unaffected. A value above 120 is clamped to 120; a negative or non-numeric value is ignored, leaving the current cap in place. Neither rejects the connection.
 
@@ -83,7 +83,7 @@ Push pacing (the default) stops there, and the transport underneath is still ord
 
 Ack pacing closes that gap. Send `{"type":"config","pacing":"ack"}` and the server keeps at most one frame in flight, waiting for `{"type":"ack","seq":N}` before sending the next. Every frame carries a monotonic `seq`; echo the one you finished rendering. Frames produced while an ack is outstanding replace each other and never reach the socket, so a client that stalls for ten seconds and resumes gets the current page, not ten seconds of history.
 
-The rate under ack pacing is one frame per acknowledgement round trip, so a client that floods input on the same socket delays its own acks and throttles itself; above roughly 120 input messages per second this is measurable. Ack pacing bounds one hop. With a proxy in the path, forward the renderer's acks; acks generated on receipt leave frames queued on the far side. Acks are cumulative, so acknowledging a newer id covers any older one. A client that opts in and then stops acking simply stops receiving frames; status, tabs, url, and console keep flowing.
+Under ack pacing one frame is in flight at a time, so the rate is one frame per transfer plus one acknowledgement round trip. Both the link's bandwidth and its latency bound it, and a link whose bandwidth-delay product exceeds a single frame goes underused. Ack pacing bounds one hop. With a proxy in the path, forward the renderer's acks; acks generated on receipt leave frames queued on the far side. Acks are cumulative, so acknowledging a newer id covers any older one. A client that opts in and then stops acking simply stops receiving frames; status, tabs, url, and console keep flowing.
 
 The two settings compose: `pacing` bounds how much is in flight, `maxFps` bounds the rate. A constrained preview usually wants both.
 

@@ -96,7 +96,7 @@ Frames are delivered latest-first: the server holds only the newest frame and re
 
 In the default push pacing the transport underneath still can: frames already accepted by the socket are delivered in order, so a client that stops reading entirely drains whatever the kernel buffered before the writer blocked. Ack pacing removes that window (see below). Status, console, and tab messages flow through a separate ordered channel, so they are never replaced by a newer message the way frames are. They are not unconditionally durable: a client that falls far enough behind can lag out of that channel and lose messages, so treat console output as a live feed rather than an audit log.
 
-Input handling is independent of frame delivery. Each connection reads input on its own task, so clicks and keystrokes dispatch to the browser immediately even while a large frame is mid-write to a slow client.
+Input handling is independent of frame delivery. Each connection reads input on its own task, so clicks and keystrokes dispatch to the browser immediately even while a large frame is mid-write to a slow client. Events go to the browser without waiting for its reply, so a click stays responsive behind a burst of mouse moves, and ordering is preserved.
 
 ### Client configuration
 
@@ -133,7 +133,7 @@ The server then keeps at most one frame in flight and waits for the client to ac
 
 Every `frame` message carries a monotonic `seq`. Echo the id of the frame you finished rendering. While an ack is outstanding, newer frames replace each other in the server and never reach the socket, so a client that stalls for ten seconds and resumes receives the current page rather than ten seconds of history. This mirrors how Chrome paces its own screencast upstream with `Page.screencastFrameAck`.
 
-Under ack pacing the frame rate is bounded by one frame per acknowledgement round trip, so a client that queues heavy input on the same socket delays its own acks and throttles its own stream. Measured: input above roughly 120 messages per second on the same connection is enough to do it. Send acks ahead of buffered input, or use push pacing.
+Under ack pacing one frame is in flight at a time, so the rate is one frame per transfer plus one acknowledgement round trip. Both the link's bandwidth and its latency bound it, and a link whose bandwidth-delay product exceeds a single frame goes underused. That headroom is the cost of the freshness guarantee.
 
 Ack pacing bounds one hop. With a proxy in the path, forward the renderer's acks; acks generated on receipt leave frames queued on the far side.
 
