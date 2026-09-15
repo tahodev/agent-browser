@@ -76,6 +76,7 @@ fn native_test_fixture_html(name: &str) -> &'static str {
         "webmcp_delayed_probe" => include_str!("test_fixtures/webmcp_delayed_probe.html"),
         "webmcp_frame_probe" => include_str!("test_fixtures/webmcp_frame_probe.html"),
         "webmcp_probe" => include_str!("test_fixtures/webmcp_probe.html"),
+        "webmcp_context_probe" => include_str!("test_fixtures/webmcp_context_probe.html"),
         _ => panic!("Unknown native test fixture: {}", name),
     }
 }
@@ -456,7 +457,7 @@ async fn e2e_webmcp_discovery_invocation_and_cancellation() {
 
 #[tokio::test]
 #[ignore]
-async fn e2e_webmcp_navigation_waits_for_delayed_initial_registration() {
+async fn e2e_webmcp_delayed_registration_appears_on_next_action() {
     let (fixture_url, fixture_server) = start_webmcp_server().await;
     let mut state = DaemonState::new();
     let resp = execute_command(
@@ -476,13 +477,266 @@ async fn e2e_webmcp_navigation_waits_for_delayed_initial_registration() {
     )
     .await;
     assert_success(&resp);
-    assert_eq!(get_data(&resp)["webmcp"]["experimental"], true);
-    assert_eq!(get_data(&resp)["webmcp"]["available"], true);
-    assert_eq!(get_data(&resp)["webmcp"]["toolCount"], 1);
+    let already_observed = get_data(&resp).get("webmcp").is_some();
+    let resp = execute_command(
+        &json!({"id": "wait", "action": "wait", "timeout": 150}),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    if !already_observed {
+        assert_eq!(get_data(&resp)["webmcp"]["experimental"], true);
+        assert_eq!(get_data(&resp)["webmcp"]["available"], true);
+        assert_eq!(get_data(&resp)["webmcp"]["toolCount"], 1);
+    }
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
     fixture_server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_webmcp_context_follows_actions_without_explicit_discovery() {
+    let (url, server) = start_webmcp_server().await;
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({"id": "launch", "action": "launch", "headless": true}),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let commands = [
+        (
+            json!({"action": "navigate", "url": format!("{url}/context.html")}),
+            -1,
+        ),
+        (json!({"action": "click", "selector": "#register"}), 1),
+        (json!({"action": "snapshot"}), -1),
+        (json!({"action": "webmcp_list", "tool": "set_message"}), -1),
+        (
+            json!({"action": "fill", "selector": "#description", "value": "Updated description"}),
+            1,
+        ),
+        (
+            json!({"action": "webmcp_invoke", "tool": "set_message", "params": {"message": "Hello from discovered tool"}}),
+            -1,
+        ),
+        (json!({"action": "gettext", "selector": "#result"}), -1),
+        (
+            json!({"action": "evaluate", "script": "history.pushState({}, '', '#route')"}),
+            -1,
+        ),
+        (
+            json!({"action": "tab_new", "url": format!("{url}/empty.html")}),
+            0,
+        ),
+        (json!({"action": "tab_switch", "tabId": "t1"}), 1),
+        (json!({"action": "tab_close", "tabId": "t2"}), -1),
+        (json!({"action": "click", "selector": "#remove"}), 0),
+        (json!({"action": "wait", "timeout": 50}), -1),
+        (json!({"action": "click", "selector": "#register"}), 1),
+        (
+            json!({"action": "navigate", "url": format!("{url}/empty.html")}),
+            0,
+        ),
+    ];
+    for (mut cmd, count) in commands {
+        cmd["id"] = json!("context");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_success(&resp);
+        let mut context = get_data(&resp)["webmcp"].clone();
+        // Chrome may deliver tool events after the action's reply. Passive
+        // observation reports them on a later ordinary action, without listing
+        // tools or retrying the mutation. Re-registration can also briefly
+        // report removal before the replacement tool is observed.
+        if count >= 0 && context["toolCount"] != count {
+            context = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let update = execute_command(
+                        &json!({"id": "context-update", "action": "wait", "timeout": 50}),
+                        &mut state,
+                    )
+                    .await;
+                    assert_success(&update);
+                    let context = &get_data(&update)["webmcp"];
+                    if context["toolCount"] == count {
+                        break context.clone();
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("Missing WebMCP update after {cmd}: {resp}"));
+        }
+        if count == -1 {
+            assert!(
+                context.is_null(),
+                "Unchanged or empty page must stay quiet: {cmd}: {resp}"
+            );
+        } else {
+            assert_eq!(context["status"], "ready", "{cmd}: {resp}");
+            assert_eq!(context["toolCount"], count, "{cmd}: {resp}");
+            assert_eq!(context["available"], count > 0);
+        }
+        if count > 0 {
+            let tool = &context["tools"][0];
+            assert_eq!(tool["name"], "set_message");
+            assert!(tool.get("inputSchema").is_none());
+            assert!(tool["frameId"].as_str().is_some_and(|id| !id.is_empty()));
+            assert_eq!(tool["origin"], url);
+            if cmd["action"] == "fill" {
+                assert_eq!(tool["description"], "Updated description");
+            }
+        }
+        if cmd["action"] == "webmcp_list" {
+            assert_eq!(get_data(&resp)["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                get_data(&resp)["tools"][0]["inputSchema"]["required"],
+                json!(["message"])
+            );
+        }
+        if cmd["action"] == "gettext" {
+            assert_eq!(get_data(&resp)["text"], "Hello from discovered tool");
+        }
+    }
+    let resp = execute_command(&json!({"id": "close", "action": "close"}), &mut state).await;
+    assert_success(&resp);
+    assert!(get_data(&resp).get("webmcp").is_none());
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_webmcp_same_document_navigation_preserves_catalog_and_invocations() {
+    let (url, server) = start_webmcp_server().await;
+    let mut state = DaemonState::new();
+    for mut cmd in [
+        json!({"action": "launch", "headless": true}),
+        json!({"action": "navigate", "url": url}),
+    ] {
+        cmd["id"] = json!("setup");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_success(&resp);
+    }
+    let resp = execute_command(
+        &json!({"id": "invoke", "action": "webmcp_invoke", "tool": "wait_for_cancel", "params": {}, "detach": true}),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let invocation_id = get_data(&resp)["invocationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.active_session_id().unwrap().to_string();
+    // Stop tool events so this test cannot pass by silently rediscovering the
+    // catalog. Page navigation events remain enabled for document invalidation.
+    browser
+        .client
+        .send_command_no_params("WebMCP.disable", Some(&session))
+        .await
+        .unwrap();
+    let resp = execute_command(&json!({"id": "settle", "action": "title"}), &mut state).await;
+    assert_success(&resp);
+    let tools = state.webmcp.tools(&session).unwrap();
+    assert!(tools.iter().any(|tool| tool.name == "wait_for_cancel"));
+    assert_eq!(state.webmcp.invocations[&invocation_id].status, "pending");
+
+    for mut cmd in [
+        json!({"action": "navigate", "url": format!("{url}/#route")}),
+        json!({"action": "snapshot"}),
+        json!({"action": "navigate", "url": format!("{url}/#next")}),
+        json!({"action": "evaluate", "script": "history.pushState({}, '', '#history')"}),
+        json!({"action": "title"}),
+    ] {
+        cmd["id"] = json!("same-document");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_success(&resp);
+        assert!(get_data(&resp).get("webmcp").is_none(), "{cmd}: {resp}");
+        assert_eq!(state.webmcp.tools(&session).unwrap(), tools, "{cmd}");
+        assert_eq!(state.webmcp.invocations[&invocation_id].status, "pending");
+    }
+
+    let resp = execute_command(
+        &json!({"id": "new-document", "action": "navigate", "url": format!("{url}/empty.html")}),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["webmcp"]["toolCount"], 0);
+    assert!(state.webmcp.tools(&session).unwrap().is_empty());
+    assert!(state.webmcp.invocations[&invocation_id].to_json()["error"]
+        .as_str()
+        .is_some_and(|error| error.starts_with("webmcp_context_changed:")));
+
+    // New documents still populate the catalog through the existing
+    // subscription and reannounce tools even when the records are identical.
+    state
+        .browser
+        .as_ref()
+        .unwrap()
+        .client
+        .send_command_no_params("WebMCP.enable", Some(&session))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let resp = execute_command(
+            &json!({"id": "reload", "action": "navigate", "url": url}),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        assert!(get_data(&resp)["webmcp"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "wait_for_cancel"));
+    }
+    let resp = execute_command(&json!({"id": "close", "action": "close"}), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_webmcp_ordinary_page_stays_quiet_without_reprobing() {
+    let (url, server) = start_webmcp_server().await;
+    let mut state = DaemonState::new();
+    for (index, mut cmd) in [
+        json!({"action": "launch", "headless": true}),
+        json!({"action": "navigate", "url": format!("{url}/empty.html")}),
+        json!({"action": "snapshot"}),
+        json!({"action": "title"}),
+        json!({"action": "evaluate", "script": "document.title"}),
+        json!({"action": "wait", "timeout": 1}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        cmd["id"] = json!(index.to_string());
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_success(&resp);
+        assert!(get_data(&resp).get("webmcp").is_none(), "{cmd}: {resp}");
+    }
+    // Disable browser-side events behind the daemon. If ordinary commands
+    // re-enable discovery, the registration below would incorrectly appear.
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.active_session_id().unwrap().to_string();
+    browser
+        .client
+        .send_command_no_params("WebMCP.disable", Some(&session))
+        .await
+        .unwrap();
+    let resp = execute_command(&json!({"id": "register", "action": "evaluate", "script": "document.modelContext.registerTool({name: 'probe', description: 'probe', inputSchema: {type: 'object'}, execute: async () => ({ok: true})}); true"}), &mut state).await;
+    assert_success(&resp);
+    assert!(get_data(&resp).get("webmcp").is_none());
+    assert_eq!(state.webmcp.observations.len(), 1);
+    let resp = execute_command(&json!({"id": "snapshot", "action": "snapshot"}), &mut state).await;
+    assert_success(&resp);
+    assert!(get_data(&resp).get("webmcp").is_none());
+    execute_command(&json!({"id": "close", "action": "close"}), &mut state).await;
+    server.abort();
 }
 
 #[tokio::test]
@@ -5398,6 +5652,10 @@ async fn start_webmcp_server() -> (String, tokio::task::JoinHandle<()>) {
                 let body = if request.starts_with("GET /frame.html ") {
                     native_test_fixture_html("webmcp_frame_probe")
                         .replace("__PORT__", &port.to_string())
+                } else if request.starts_with("GET /context.html ") {
+                    native_test_fixture_html("webmcp_context_probe").to_string()
+                } else if request.starts_with("GET /empty.html ") {
+                    "<!doctype html><title>No page tools</title>".to_string()
                 } else if request.starts_with("GET /delayed.html ") {
                     native_test_fixture_html("webmcp_delayed_probe").to_string()
                 } else {
