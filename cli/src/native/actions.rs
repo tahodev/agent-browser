@@ -1089,8 +1089,8 @@ impl DaemonState {
         client: Arc<CdpClient>,
         session_id: String,
     ) -> Result<(), String> {
-        let initial_image = match recording::capture_initial_image(&client, &session_id).await {
-            Ok(image) => image,
+        let initial_frame = match recording::capture_initial_image(&client, &session_id).await {
+            Ok(frame) => frame,
             Err(error) => {
                 self.rollback_failed_recording_start().await;
                 return Err(error);
@@ -1116,11 +1116,13 @@ impl DaemonState {
         let handle = recording::spawn_recording_task(
             client,
             capture_session,
-            initial_image,
+            initial_frame,
             self.recording_state.output_path.clone(),
             self.recording_state.fps,
             shared_count.clone(),
             shared_captured.clone(),
+            self.recording_state.cursor,
+            self.recording_state.shared_cursor.clone(),
             self.recording_state.contact_sheet_path.clone(),
             self.recording_state.contact_sheet_threshold,
             shared_contact_sheet_count.clone(),
@@ -5624,6 +5626,25 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
     Ok(response)
 }
 
+fn record_click_animation(
+    result: &interaction::ClickResult,
+    mouse: &mut MouseState,
+    history: &recording::SharedRecordingCursor,
+) {
+    mouse.x = result.x;
+    mouse.y = result.y;
+    mouse.buttons = i32::from(result.pending_release.is_some());
+    if let Ok(mut cursor) = history.lock() {
+        cursor.record(result.x, result.y, 0);
+        if result.button_pressed {
+            cursor.record(result.x, result.y, 1);
+            if result.pending_release.is_none() {
+                cursor.record(result.x, result.y, 0);
+            }
+        }
+    }
+}
+
 async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let selector = cmd
         .get("selector")
@@ -5729,6 +5750,13 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             &state.iframe_sessions,
         )
         .await?;
+        let offset = super::element::session_viewport_offset(
+            &mgr.client,
+            &session_id,
+            &target_session_id,
+            &state.iframe_sessions,
+        )
+        .await?;
         move_mouse_interpolated(
             &mgr.client,
             &target_session_id,
@@ -5740,6 +5768,8 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             input_mode == "human",
             cmd.get("seed").and_then(Value::as_u64).unwrap_or(0),
             0,
+            offset,
+            &state.recording_state.shared_cursor,
         )
         .await?;
     }
@@ -5754,7 +5784,11 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &state.iframe_sessions,
     )
     .await?;
-    (state.mouse_state.x, state.mouse_state.y) = result.position;
+    record_click_animation(
+        &result,
+        &mut state.mouse_state,
+        &state.recording_state.shared_cursor,
+    );
 
     if result.dialog_opened {
         state.pending_pointer_release = result.pending_release;
@@ -5779,7 +5813,11 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &state.iframe_sessions,
     )
     .await?;
-    (state.mouse_state.x, state.mouse_state.y) = result.position;
+    record_click_animation(
+        &result,
+        &mut state.mouse_state,
+        &state.recording_state.shared_cursor,
+    );
     if result.dialog_opened {
         state.pending_pointer_release = result.pending_release;
         return Ok(json!({ "clicked": selector, "dialogOpened": true }));
@@ -5919,6 +5957,9 @@ async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     )
     .await?;
     (state.mouse_state.x, state.mouse_state.y) = position;
+    if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+        cursor.record(position.0, position.1, state.mouse_state.buttons);
+    }
     Ok(json!({ "hovered": selector }))
 }
 
@@ -6007,6 +6048,9 @@ async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     .await?
     {
         (state.mouse_state.x, state.mouse_state.y) = position;
+        if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+            cursor.record(position.0, position.1, state.mouse_state.buttons);
+        }
     }
     Ok(json!({ "checked": selector }))
 }
@@ -6029,6 +6073,9 @@ async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     .await?
     {
         (state.mouse_state.x, state.mouse_state.y) = position;
+        if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+            cursor.record(position.0, position.1, state.mouse_state.buttons);
+        }
     }
     Ok(json!({ "unchecked": selector }))
 }
@@ -6876,6 +6923,10 @@ async fn handle_mouse(cmd: &Value, state: &DaemonState) -> Result<Value, String>
             Some(&session_id),
         )
         .await?;
+    if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+        let buttons = i32::from(event_type == "mousePressed");
+        cursor.record(x, y, buttons);
+    }
 
     Ok(json!({ "dispatched": event_type }))
 }
@@ -7213,7 +7264,11 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &state.iframe_sessions,
     )
     .await?;
-    (state.mouse_state.x, state.mouse_state.y) = result.position;
+    record_click_animation(
+        &result,
+        &mut state.mouse_state,
+        &state.recording_state.shared_cursor,
+    );
 
     // Wait for download to complete
     const DOWNLOAD_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
@@ -7374,6 +7429,7 @@ fn recording_options_from_command(cmd: &Value) -> Result<recording::RecordingOpt
     recording::validate_contact_sheet_threshold(contact_sheet_threshold)?;
     Ok(recording::RecordingOptions {
         fps: recording_fps_from_command(cmd)?,
+        cursor: cmd.get("cursor").and_then(Value::as_bool).unwrap_or(false),
         contact_sheet: cmd
             .get("contactSheet")
             .and_then(Value::as_bool)
@@ -7521,6 +7577,7 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
         "previousPath": previous_path,
         "path": path,
         "fps": state.recording_state.fps,
+        "cursor": state.recording_state.cursor,
         "contactSheet": state.recording_state.contact_sheet,
         "contactSheetPath": state.recording_state.contact_sheet_path,
     }))
@@ -7968,6 +8025,10 @@ async fn handle_dialog(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if let Some(release) = state.pending_pointer_release.take() {
         if let Some(ref mgr) = state.browser {
             let _ = interaction::dispatch_pending_release(&mgr.client, &release).await;
+        }
+        state.mouse_state.buttons = 0;
+        if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+            cursor.record(state.mouse_state.x, state.mouse_state.y, 0);
         }
     }
     Ok(json!({ "handled": true, "accepted": accept }))
@@ -9418,7 +9479,11 @@ async fn execute_subaction(
                 &state.iframe_sessions,
             )
             .await?;
-            (state.mouse_state.x, state.mouse_state.y) = result.position;
+            record_click_animation(
+                &result,
+                &mut state.mouse_state,
+                &state.recording_state.shared_cursor,
+            );
             if result.dialog_opened {
                 state.pending_pointer_release = result.pending_release;
                 return Ok(json!({ "clicked": selector, "dialogOpened": true }));
@@ -9452,6 +9517,9 @@ async fn execute_subaction(
             .await?
             {
                 (state.mouse_state.x, state.mouse_state.y) = position;
+                if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+                    cursor.record(position.0, position.1, state.mouse_state.buttons);
+                }
             }
             Ok(json!({ "checked": selector }))
         }
@@ -9465,6 +9533,9 @@ async fn execute_subaction(
             )
             .await?;
             (state.mouse_state.x, state.mouse_state.y) = position;
+            if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+                cursor.record(position.0, position.1, state.mouse_state.buttons);
+            }
             Ok(json!({ "hovered": selector }))
         }
         "text" => {
@@ -10187,6 +10258,20 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let seed = cmd.get("seed").and_then(Value::as_u64).unwrap_or(0);
 
     // Approach the source before pressing so hover and pointer path handlers fire.
+    let source_offset = super::element::session_viewport_offset(
+        &mgr.client,
+        &session_id,
+        &source_session_id,
+        &state.iframe_sessions,
+    )
+    .await?;
+    let target_offset = super::element::session_viewport_offset(
+        &mgr.client,
+        &session_id,
+        &target_session_id,
+        &state.iframe_sessions,
+    )
+    .await?;
     move_mouse_interpolated(
         &mgr.client,
         &source_session_id,
@@ -10198,6 +10283,8 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         human,
         seed,
         0,
+        source_offset,
+        &state.recording_state.shared_cursor,
     )
     .await?;
     mgr.client
@@ -10207,11 +10294,14 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
             Some(&source_session_id),
         )
         .await?;
+    if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+        cursor.record(sx + source_offset.0, sy + source_offset.1, 1);
+    }
 
     // Move in steps to target, keeping the left button held (buttons: 1) so
     // that the browser sees a drag rather than a plain pointer move.
-    state.mouse_state.x = sx;
-    state.mouse_state.y = sy;
+    state.mouse_state.x = sx + source_offset.0;
+    state.mouse_state.y = sy + source_offset.1;
     state.mouse_state.buttons = 1;
     move_mouse_interpolated(
         &mgr.client,
@@ -10224,6 +10314,8 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         human,
         seed.wrapping_add(1),
         1,
+        target_offset,
+        &state.recording_state.shared_cursor,
     )
     .await?;
 
@@ -10236,6 +10328,9 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         )
         .await?;
     state.mouse_state.buttons = 0;
+    if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+        cursor.record(tx + target_offset.0, ty + target_offset.1, 0);
+    }
 
     Ok(json!({ "dragged": true, "source": source, "target": target }))
 }
@@ -12095,7 +12190,11 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
         &state.iframe_sessions,
     )
     .await?;
-    (state.mouse_state.x, state.mouse_state.y) = result.position;
+    record_click_animation(
+        &result,
+        &mut state.mouse_state,
+        &state.recording_state.shared_cursor,
+    );
 
     // Wait for navigation after submit (with fallback timeout)
     let mut rx = mgr.client.subscribe();
@@ -12421,6 +12520,13 @@ async fn handle_input_mouse(cmd: &Value, state: &mut DaemonState) -> Result<Valu
     mgr.client
         .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
         .await?;
+    if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+        cursor.record(
+            state.mouse_state.x,
+            state.mouse_state.y,
+            state.mouse_state.buttons,
+        );
+    }
     Ok(json!({ "dispatched": event_type }))
 }
 
@@ -12535,9 +12641,12 @@ async fn move_mouse_interpolated(
     human: bool,
     seed: u64,
     buttons: i32,
+    viewport_offset: (f64, f64),
+    recording_cursor: &recording::SharedRecordingCursor,
 ) -> Result<(), String> {
-    let start_x = mouse_state.x;
-    let start_y = mouse_state.y;
+    // Cursor state stays in page coordinates even when dispatching to an OOPIF.
+    let start_x = mouse_state.x - viewport_offset.0;
+    let start_y = mouse_state.y - viewport_offset.1;
     let dx = target_x - start_x;
     let dy = target_y - start_y;
     let distance = dx.hypot(dy);
@@ -12588,6 +12697,11 @@ async fn move_mouse_interpolated(
         client
             .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(session_id))
             .await?;
+        mouse_state.x = x + viewport_offset.0;
+        mouse_state.y = y + viewport_offset.1;
+        if let Ok(mut cursor) = recording_cursor.lock() {
+            cursor.record(mouse_state.x, mouse_state.y, buttons);
+        }
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
@@ -12665,6 +12779,8 @@ async fn handle_mousemove(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         human,
         seed,
         buttons,
+        (0.0, 0.0),
+        &state.recording_state.shared_cursor,
     )
     .await?;
     Ok(json!({ "moved": true, "x": x, "y": y }))
@@ -12690,6 +12806,13 @@ async fn handle_mousedown(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     mgr.client
         .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
         .await?;
+    if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+        cursor.record(
+            state.mouse_state.x,
+            state.mouse_state.y,
+            state.mouse_state.buttons,
+        );
+    }
     Ok(json!({ "pressed": true }))
 }
 
@@ -12713,6 +12836,13 @@ async fn handle_mouseup(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     mgr.client
         .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
         .await?;
+    if let Ok(mut cursor) = state.recording_state.shared_cursor.lock() {
+        cursor.record(
+            state.mouse_state.x,
+            state.mouse_state.y,
+            state.mouse_state.buttons,
+        );
+    }
     Ok(json!({ "released": true }))
 }
 
