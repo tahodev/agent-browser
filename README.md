@@ -321,7 +321,7 @@ agent-browser mouse up [button]       # Release button
 agent-browser mouse wheel <dy> [dx]   # Scroll wheel
 ```
 
-Add `--human` to `click` or `drag` for curved, eased movement from the current cursor position.
+Add `--human` to `click` or `drag` for curved, eased movement from the current cursor position. For timed mouse moves, `--duration` is the target total duration, including browser response time; a slow browser can still extend it.
 
 ### Browser Settings
 
@@ -466,6 +466,8 @@ agent-browser state clear [name]      # Clear states for session
 agent-browser state clear --all       # Clear all saved states
 agent-browser state clean --older-than <days>  # Delete old states
 ```
+
+With recording `--cursor`, the pointer and click ripple render with the page, keeping drags synchronized in every captured frame. The temporary overlay is inert, hidden from accessibility snapshots, and removed when recording stops. Screenshots taken during the recording include it.
 
 ### Navigation
 
